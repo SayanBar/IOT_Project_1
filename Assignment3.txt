@@ -1,0 +1,754 @@
+/*
+ * @section License
+ * <b>(C) Copyright 2014 SILICON LABS, http://www.silabs.com</b>
+ *******************************************************************************
+ *
+ * This file is licensed under the SILICON LABS Software License Agreement. See
+ * "http://developer.silabs.com/legal/version/v11/Silicon_Labs_Software_License_Agreement.txt"
+ * for details. Before using this software for any purpose, you must agree to the
+ * terms of that agreement.
+ *
+ ******************************************************************************/
+
+/*
+ * Assignment 3
+ * Author : Sayan Barman
+ * Course : Mobile Computing and IOT Security
+ *
+ * Description : Develop the code for the Leopard Gecko to indicate whether the on board temperature
+ * indicates a temperature below a low limit set point or indicates a temperature above another set point.
+ * The temperature used to determine whether the temperature has gone outside its temperature settings,
+ * will be an average of 1000 temperature readings.
+ * To save energy by not requiring the CPU to be on during these 1000 readings,
+ * the results from the ADC should be sent to memory via DMA and only after 1000 readings should the CPU wake up,
+ * calculate the average, and turn on LED1 if outside of the temperature limit settings.
+ */
+
+
+
+
+/*including all header files*/
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include "em_device.h"
+#include "em_chip.h"
+#include "em_int.h"
+#include "em_cmu.h"
+#include "em_emu.h"
+#include "em_letimer.h"
+#include "em_gpio.h"
+#include "em_acmp.h"
+#include "em_system.h"
+#include "em_timer.h"
+#include "em_adc.h"
+#include "dmactrl.h"
+#include "em_dma.h"
+
+/*defining all constants*/
+
+#define Energy_mode EM3
+#define DMA_Status ON
+#define ADCSAMPLES 1000
+#define DMA_CHANNEL_ADC       0
+#define ACMP_NEG_CHANNEL acmpChannelVDD
+#define ACMP_POS_CHANNEL acmpChannel6
+#define LED_Port gpioPortE
+#define LED0_Pin 2
+#define LED1_Pin 3
+#define Light_Excite_Port gpioPortD
+#define Light_Excite_Pin 6
+#define Light_Sense_Port gpioPortC
+#define Light_Sense_Pin 6
+#define lowTempLimit 15
+#define highTempLimit 35
+#define UF_Count 0x0000
+#define ADCFreq 130000
+#define LFXOFreq 32768
+#define ULFRFreq 1000
+#define Period 4
+#define LOW 2
+#define HIGH 61
+
+uint16_t LEVEL= LOW;
+DMA_CB_TypeDef cb;
+
+volatile uint16_t ramBufferAdcData[ADCSAMPLES];//buffer array to store 1000 ADC samples
+volatile bool transferActive;//to check whether the transfer is done or needs to be done
+
+/* Energy mode enum*/
+typedef enum{
+EM0=0,
+EM1=1,
+EM2=2,
+EM3=3
+}sleepstate_enum;
+
+/*LED OFF/ON enum */
+typedef enum
+{
+ON=1,
+OFF=0
+}LED_enum;
+
+int flag_level=0;//to check which VDD level it is on.
+
+float osc=0.0;//oscillation ratio for calibration
+int sleep_block_counter[4];//array to be used to sleep in different Energy modes
+
+
+int x=0;//counter to count the elements of the buffer array
+
+void transferComplete(unsigned int channel, bool primary, void *user);//declaring the DMA transfer function taken from SILICON LABS
+
+
+/*function to calculate the average of all the values in the buffer array*/
+
+float average()
+{
+	int sum=0,i;
+	float avg=0.0;
+	for(i=0;i<ADCSAMPLES;i++)
+	sum += ramBufferAdcData[i];
+	avg= (float)sum/(float)ADCSAMPLES;
+	return avg;
+}
+
+/* blockSleepMode routine taken from SILICON LABS */
+
+void blockSleepMode(sleepstate_enum minimumMode)
+{
+INT_Disable();
+sleep_block_counter[minimumMode]++;
+INT_Enable();
+}
+
+
+/* unblockSleepMode routine taken from SILICON LABS */
+
+void unblockSleepMode(sleepstate_enum minimumMode)
+{
+	INT_Disable();
+	if(sleep_block_counter[minimumMode]>0)
+	sleep_block_counter[minimumMode]--;
+	INT_Enable();
+}
+
+/* sleep routine taken from SILICON LABS */
+
+void sleep(void)
+{
+	if (sleep_block_counter[0] > 0)
+	{
+		return; // Blocked everything below EM0, so just return
+	}
+	else if(sleep_block_counter[1] > 0)
+	{
+	    EMU_EnterEM1(); // Blocked everything below EM1, enter EM1
+
+	}
+	else if(sleep_block_counter[2] > 0)
+	{
+		EMU_EnterEM2(true); //Blocked everything below EM2, enter EM2
+
+	}
+	else if(sleep_block_counter[3]>0)
+	{
+		EMU_EnterEM3(true); //Blocked everything below EM3, enter EM3
+
+	}
+	else
+    return;
+}
+
+/*Calibration to get an accurate time interval for COMP1 and UF interrupts*/
+
+void calib_ultra(void)
+{
+	int IntFlags;
+	uint32_t timer0count;
+	uint32_t timer1count;
+	uint32_t LFXO_COUNT=UF_Count;
+	uint32_t ULFRCO_COUNT=UF_Count;
+
+
+
+    //set up clocks for LFXO
+	CMU_OscillatorEnable(cmuOsc_LFXO,true,true);
+
+    CMU_ClockEnable(cmuClock_CORELE, true); /* Enable CORELE clock */
+    CMU_ClockSelectSet(cmuClock_LFA,cmuSelect_LFXO); /* Select LFXO as clock source for LFA for EM0 to EM2 */
+
+
+    /* Select TIMER0 parameters */
+		  TIMER_Init_TypeDef timer0Init =
+		  {
+		    .enable     = false,
+		    .debugRun   = true,
+		    .prescale   = timerPrescale1,
+		    .clkSel     = timerClkSelHFPerClk,
+		    .fallAction = timerInputActionNone,
+		    .riseAction = timerInputActionNone,
+		    .mode       = timerModeUp,
+		    .dmaClrAct  = false,
+		    .quadModeX4 = false,
+		    .oneShot    = false,
+		    .sync       = false
+		  };
+
+
+		  /* Select TIMER1 parameters */
+		  	  TIMER_Init_TypeDef timer1Init =
+		  	  {
+		  	    .enable     = false,
+		  	    .debugRun   = true,
+		  	    .prescale   = timerPrescale1,
+		  	    .clkSel     = timerClkSelCascade,
+		  	    .fallAction = timerInputActionNone,
+		  	    .riseAction = timerInputActionNone,
+		  	    .mode       = timerModeUp,
+		  	    .dmaClrAct  = false,
+		  	    .quadModeX4 = false,
+		  	    .oneShot    = false,
+		  	    .sync       = false
+		  	  };
+
+
+		  //Clear all timer0 interrupts
+		  int  IntFlags0=TIMER0->IF;
+		  TIMER0->IFC=IntFlags0;
+
+		  //Clear all timer1 interrupts
+		  int  IntFlags1=TIMER1->IF;
+		  TIMER1->IFC=IntFlags1;
+
+		  /* Enable TIMER0 and TIMER1 interrupt vector in NVIC */
+		  NVIC_EnableIRQ(TIMER0_IRQn);
+		  NVIC_EnableIRQ(TIMER1_IRQn);
+
+
+	     /* Set configurations for LETIMER 0 */
+		const LETIMER_Init_TypeDef letimerInit =
+		{
+		.enable = false, /* Start counting when init completed*/
+		.debugRun = false, /* Counter shall not keep running during debug halt. */
+		.rtcComp0Enable = false, /* Start counting on RTC COMP0 match. */
+		.rtcComp1Enable = false, /* Don't start counting on RTC COMP1 match. */
+		.comp0Top = true, /* Load COMP0 register into CNT when counter underflows. COMP is used as TOP */
+		.bufTop = false, /* Don't load COMP1 into COMP0 when REP0 reaches 0. */
+		.out0Pol = 0, /* Idle value for output 0. */
+		.out1Pol = 0, /* Idle value for output 1. */
+		.ufoa0 = letimerUFOANone, /* PwM output on output 0 */
+		.ufoa1 = letimerUFOANone, /* No output on output 1*/
+		.repMode = letimerRepeatFree /* Count while REP != 0 */
+		};
+
+
+		LETIMER0->CNT=LFXOFreq; // set count for 1s for LFXO
+		TIMER0->CNT=UF_Count;  //Set Timer0 initial count to 0
+		TIMER1->CNT=UF_Count;  //Set Timer1 initial count to 0
+
+
+
+		//Clear all interrupts of LETIMER0
+		        IntFlags=LETIMER0->IF;
+		        LETIMER0->IFC=IntFlags;
+
+
+          /* Enable LETIMER0 interrupt vector in NVIC*/
+		NVIC_EnableIRQ(LETIMER0_IRQn);
+
+		//Enable clocks for timers
+		CMU_ClockEnable(cmuClock_LETIMER0, true); /*Enable clock for LETIMER0*/
+		CMU_ClockEnable(cmuClock_TIMER0, true); /*Enable clock for TIMER0*/
+		CMU_ClockEnable(cmuClock_TIMER1, true); /*Enable clock for TIMER0*/
+
+	   /* Initializing TIMER0,TIMER1 and LETIMER0 */
+		LETIMER_Init(LETIMER0, &letimerInit);
+		TIMER_Init(TIMER0, &timer0Init);
+		TIMER_Init(TIMER1, &timer1Init);
+
+		//enabling timers to start count
+        LETIMER_Enable(LETIMER0, true);
+        TIMER_Enable(TIMER0, true);
+        TIMER_Enable(TIMER1, true);
+
+
+        while(LETIMER0->CNT!=UF_Count);
+
+        //Disabling LETIMER0,TIMER1 and TIMER0 when LETIMER0 underflows
+        LETIMER_Enable(LETIMER0, false);
+        TIMER_Enable(TIMER0, false);
+        TIMER_Enable(TIMER1, false);
+
+        //Load timer 0 and 1 counts
+        timer0count=TIMER0->CNT;
+        timer1count=TIMER1->CNT;
+
+
+
+        //Generating LFXO_Count using Timer0 and Timer1 count in cascade
+        LFXO_COUNT=((timer1count << 16)|(timer0count));
+
+        TIMER0->CNT=0x000;
+        TIMER1->CNT=0x000;
+
+        //Set necessary clocks for ULFRCO
+         // CMU_ClockSelectSet(cmuClock_LFA,cmuSelect_ULFRCO);
+          CMU_OscillatorEnable(cmuOsc_LFXO,false,false);
+          CMU_ClockSelectSet(cmuClock_LFA,cmuSelect_ULFRCO);
+
+          //Enable clock for timers
+          CMU_ClockEnable(cmuClock_LETIMER0, true); /*Enable clock for LETIMER0*/
+          CMU_ClockEnable(cmuClock_TIMER0, true); /*Enable clock for TIMER0*/
+          CMU_ClockEnable(cmuClock_TIMER1, true); /*Enable clock for TIMER0*/
+
+       LETIMER_Init(LETIMER0, &letimerInit);
+       LETIMER0->CNT=ULFRFreq;                   //Load count for 1s in ULFRCO
+
+       //Timers are enabled to start counting
+       LETIMER_Enable(LETIMER0, true);
+       TIMER_Enable(TIMER0, true);
+       TIMER_Enable(TIMER1, true);
+
+       //Timers run till LETIMER underflows
+       while(LETIMER0->CNT!=UF_Count);
+       //Timers are stopped to take the count
+       TIMER_Enable(TIMER0, false);
+       TIMER_Enable(TIMER1, false);
+       LETIMER_Enable(LETIMER0, false);
+
+       //Counts are saved in the respective variables
+       timer0count=TIMER0->CNT;
+       timer1count=TIMER1->CNT;
+
+
+        ULFRCO_COUNT=((timer1count << 16)|(timer0count));//Save 32 bit ULFRCO count value in after cascading timer 0 and timer 1
+
+      osc=(float)LFXO_COUNT/(float)ULFRCO_COUNT;//oscillation ratio is determined
+
+}
+
+
+/*Function to turn LED0 and LED1 on and off*/
+
+void LED_activate(LED_enum state,int LED_Number)
+{
+
+	if(LED_Number==0)
+	if(state==1)
+		GPIO_PinOutSet(LED_Port,LED0_Pin);//turning on LED0
+	else
+		GPIO_PinOutClear(LED_Port,LED0_Pin);//turning off LED0
+	else
+		if(state==1)
+				GPIO_PinOutSet(LED_Port,LED1_Pin);//turning on LED1
+			else
+				GPIO_PinOutClear(LED_Port,LED1_Pin);//turning off LED1
+}
+
+
+/*Function to set up the DMA*/
+
+void setupDma(void)
+{
+  DMA_Init_TypeDef        dmaInit;
+  DMA_CfgChannel_TypeDef  chnlCfg;
+  DMA_CfgDescr_TypeDef    descrCfg;
+
+  /* Initializing the DMA */
+  dmaInit.hprot        = 0;
+  dmaInit.controlBlock = dmaControlBlock;
+  DMA_Init(&dmaInit);
+
+  /* Setting up call-back function */
+  cb.cbFunc  = transferComplete;
+  cb.userPtr = NULL;
+
+  /* Setting up channel */
+  chnlCfg.highPri   = false;
+  chnlCfg.enableInt = true;
+  chnlCfg.select    = DMAREQ_ADC0_SINGLE;
+  chnlCfg.cb        = &cb;
+  DMA_CfgChannel(DMA_CHANNEL_ADC, &chnlCfg);
+
+  /* Setting up channel descriptor */
+  descrCfg.dstInc  = dmaDataInc2;
+  descrCfg.srcInc  = dmaDataIncNone;
+  descrCfg.size    = dmaDataSize2;
+  descrCfg.arbRate = dmaArbitrate1;
+  descrCfg.hprot   = 0;
+  DMA_CfgDescr(DMA_CHANNEL_ADC, true, &descrCfg);
+
+  /* Setting flag to indicate that transfer is in progress
+   * will be cleared by call-back function. */
+    transferActive = true;
+
+  /* Starting transfer. Using Basic since every transfer must be initiated
+   * by the ADC. */
+  DMA_ActivateBasic(DMA_CHANNEL_ADC,
+                    true,
+                    false,
+                    (void *)ramBufferAdcData,
+                    (void *)&(ADC0->SINGLEDATA),
+                    ADCSAMPLES - 1);
+}
+
+
+/*Function to set up ADC*/
+
+ static void ADCConfig(void)
+{
+  ADC_Init_TypeDef       init       = ADC_INIT_DEFAULT;
+  ADC_InitSingle_TypeDef singleInit = ADC_INITSINGLE_DEFAULT;
+
+
+  /* Init common settings for both single conversion and scan mode */
+  init.timebase = ADC_TimebaseCalc(0);
+
+  /* Set ADC clock to 130 KHz, use default HFPERCLK */
+  init.prescale = ADC_PrescaleCalc(ADCFreq, 0);
+
+
+ /*initializing ADC0*/
+  ADC_Init(ADC0, &init);
+
+  /* Init for single conversion use, measure Temperature Input with 1.25 reference in 12 bit resolution */
+  singleInit.reference  = adcRef1V25;
+  singleInit.input      = adcSingleInpTemp;
+  singleInit.resolution = adcRes12Bit;
+  singleInit.rep = true;
+
+  /* 1 cycle should be safe for all ADC clock frequencies */
+  singleInit.acqTime = adcAcqTime1;
+
+  /*initializing ADC0 in Single Mode*/
+  ADC_InitSingle(ADC0, &singleInit);
+
+  /*Enabling ADC interrupts if DMA is off*/
+  if(DMA_Status==OFF)
+  {
+  ADC_IntEnable(ADC0, ADC_IF_SINGLE);
+  NVIC_EnableIRQ(ADC0_IRQn);
+  }
+}
+
+
+ /*Function to convert the average of 1000 ADC samples to a temperature in Celsius taken from SILICON LABS*/
+
+float convertToCelsius(float adcSample)
+{
+  float temp;
+  /* Factory calibration temperature from device information page. */
+  float cal_temp_0 = (float)((DEVINFO->CAL & _DEVINFO_CAL_TEMP_MASK)
+                             >> _DEVINFO_CAL_TEMP_SHIFT);
+
+  float cal_value_0 = (float)((DEVINFO->ADC0CAL2
+                               & _DEVINFO_ADC0CAL2_TEMP1V25_MASK)
+                              >> _DEVINFO_ADC0CAL2_TEMP1V25_SHIFT);
+
+  /* Temperature gradient (from datasheet) */
+  float t_grad = -6.27;
+
+  temp = (cal_temp_0 - ((cal_value_0 - adcSample)  / t_grad));
+
+  return temp;
+}
+
+/*Function for DMA transfer whose defintion has been taken from SILICON LABS and modified to quite an extent*/
+
+void transferComplete(unsigned int channel, bool primary, void *user)
+{
+
+	INT_Disable();
+
+	ADC0->CMD |=ADC_CMD_SINGLESTOP;//stopping the ADC
+
+   float avg=average();
+   avg=convertToCelsius(avg);//temperature is calculated
+
+   if(avg>=lowTempLimit && avg<=highTempLimit)//checking whether it's in the range and turning LED ON/OFF
+	LED_activate(OFF,1);
+   else
+	LED_activate(ON,1);
+
+   transferActive = false;//flag value to signify that the transfer is done
+
+  unblockSleepMode(EM1);
+  INT_Enable();
+}
+
+
+/*ADC0 Interrupt Handler to be used when DMA is off*/
+
+void ADC0_IRQHandler(void)
+{
+	INT_Disable();
+	int flag=ADC0->IF;
+	ADC0->IFC=flag;
+
+    float temp=0.0;
+	uint32_t sum=0;
+    float avg=0.0;
+
+    /*Storing all the samples in the buffer array*/
+    if(x<ADCSAMPLES)
+    {
+    	ramBufferAdcData[x]= ADC0->SINGLEDATA;
+    x++;
+    }
+    /*Calculating the temperature using the samples and turning LED1 ON/OFF*/
+    else
+    	{
+    	ADC0->CMD |=ADC_CMD_SINGLESTOP;
+    	for(x=0;x<ADCSAMPLES;x++)
+    	sum=sum+ramBufferAdcData[x];
+    	avg=sum/ADCSAMPLES;
+    	x=0;
+
+    	unblockSleepMode(EM1);
+
+    temp=convertToCelsius(avg);
+    if(temp>=lowTempLimit && temp<=highTempLimit)//turning LED1 ON/OFF according to the temperature calculated
+    	LED_activate(OFF,1);
+    else
+    	LED_activate(ON,1);
+    }
+
+    INT_Enable();
+}
+
+/* Interrupt Service Routine for LETIMER0 */
+
+void LETIMER0_IRQHandler(void)
+{
+
+
+	INT_Disable();//disabling all interrupts
+
+	 int flag=LETIMER0->IF;//reading the interrupt
+
+	if((flag & LETIMER_IF_COMP1)!=0)//Comp1 interrupt
+	{
+	    GPIO_PinOutSet(Light_Excite_Port,Light_Excite_Pin);//enabling the excite pin
+		ACMP_Enable(ACMP0);//Enabling ACMP to read ACMP_STATUS_ACMPOUT
+		while (!(ACMP0->STATUS & ACMP_STATUS_ACMPACT)) ;//Warm up
+	 }
+
+	if((flag & LETIMER_IF_UF)!=0)//Underflow Interrupt
+		{
+		if(flag_level==0)
+		   {
+		   if(!(ACMP0->STATUS & ACMP_STATUS_ACMPOUT))//checking ACMPOUT bit whether it's above or below the lower limit(2)
+		   {
+			LED_activate(ON,0);
+			flag_level=1;
+			LEVEL = HIGH;
+			ACMP0->INPUTSEL = 0x3DA6;//writing to INPUTSEL register to alter the VDD value to the higher level(61)
+		   }
+		   }
+		if(flag_level==1)
+		{
+			if(ACMP0->STATUS & ACMP_STATUS_ACMPOUT)//checking ACMPOUT bit whether it's above or below the higher limit(61)
+			{
+			    LED_activate(OFF,0);
+				flag_level=0;
+				LEVEL=LOW;
+				ACMP0->INPUTSEL = 0x02A6;////writing to INPUTSEL register to alter the VDD value to the lower level(2)
+
+			}
+		}
+		GPIO_PinOutClear(Light_Excite_Port,Light_Excite_Pin);//disabling the excite pin
+		ACMP_Disable(ACMP0);//disabling ACMP to save energy*/
+
+		/*checking whether DMA is on and calling ActiveBasic() function*/
+		if(DMA_Status==ON)
+		{
+		DMA_ActivateBasic(DMA_CHANNEL_ADC,
+		                    true,
+		                    false,
+		                    (void *)ramBufferAdcData,
+		                    (void *)&(ADC0->SINGLEDATA),
+		                    ADCSAMPLES - 1);
+		transferActive=true;//flag value to signify that the transfer needs to be done
+
+		}
+		blockSleepMode(EM1);
+		ADCConfig();
+		ADC_Start(ADC0, adcStartSingle);//Starting the ADC
+
+	}
+	LETIMER0->IFC=flag;//clearing all interrupts
+
+	INT_Enable(); //enabling all interrupts
+
+}
+
+
+/*Function to set up GPIO*/
+
+void gpio_setup(void)
+{
+  /* Enable GPIO in CMU */
+  CMU_ClockEnable(cmuClock_GPIO, true);
+
+  GPIO_PinModeSet(LED_Port, LED0_Pin, gpioModePushPull, 0);//Configure LED0
+  GPIO_PinModeSet(LED_Port, LED1_Pin, gpioModePushPull, 0);//Configure LED1
+
+  GPIO_PinModeSet(Light_Excite_Port,Light_Excite_Pin, gpioModePushPull, 0);//Configure Pin to control excite
+  GPIO_PinModeSet(Light_Sense_Port, Light_Sense_Pin, gpioModeDisabled, 0);//Configure Pin to control sense
+}
+
+
+
+
+/*Setting up the Clock Management Unit */
+
+void CMU_setup()
+{
+
+	          /* Select clock source for HF clock. */
+			  CMU_ClockSelectSet(cmuClock_HF, cmuSelect_HFRCO);
+
+			  /* Select clock source for LFA clock. */
+			  CMU_ClockSelectSet(cmuClock_LFA, cmuSelect_LFXO);
+			  if(Energy_mode==EM3)
+			  CMU_ClockSelectSet(cmuClock_LFA,cmuSelect_ULFRCO);
+
+			  /* Disable clock source for LFB clock. */
+			  CMU_ClockSelectSet(cmuClock_LFB, cmuSelect_Disabled);
+
+		      /* Enabling CORE,LETIMER0,ADC0,DMA and GPIO clocks*/
+	          CMU_ClockEnable(cmuClock_CORELE, true);
+	          CMU_ClockEnable(cmuClock_LETIMER0, true);
+	          CMU_ClockEnable(cmuClock_GPIO, true);
+	          CMU_ClockEnable(cmuClock_ADC0, true);
+	          CMU_ClockEnable(cmuClock_DMA, true);
+	          /* Enable clock for ACMP0. */
+	          CMU_ClockEnable(cmuClock_ACMP0, true);
+
+
+              /*Prescaling LETIMER0*/
+	          CMU_ClockDivSet(cmuClock_LETIMER0, cmuClkDiv_2);
+
+
+
+}
+
+
+
+/* Setting up LETIMER */
+
+void LETIMER_setup(void)
+{
+  /*Setting a counter of 4 secs on Comp0Top and 4 ms on Comp1 to produce an interrupt at Comp1
+   *  Setting different frequencies for LFXO and ULFRCO  */
+
+    LETIMER_CompareSet(LETIMER0, 0, ((Period/2)*LFXOFreq)-1);
+    LETIMER_CompareSet(LETIMER0, 1, 66);
+
+
+    if(Energy_mode==EM3)
+    {
+    	if(osc!=0)
+    	{
+    	LETIMER_CompareSet(LETIMER0, 0, (Period/2)*ULFRFreq*osc);
+    	LETIMER_CompareSet(LETIMER0, 1, (Period/2)*osc);
+    	}
+    	else
+    	{
+    		LETIMER_CompareSet(LETIMER0, 0, (Period/2)*ULFRFreq);
+    		LETIMER_CompareSet(LETIMER0, 1, (Period/2));
+    	}
+    }
+
+
+  /* Set configurations for LETIMER 0 */
+  const LETIMER_Init_TypeDef letimerInit =
+  {
+  .enable         = true,                   /* Start counting when init completed. */
+  .debugRun       = false,                  /* Counter shall not keep running during debug halt. */
+  .rtcComp0Enable = false,                  /* Don't start counting on RTC COMP0 match. */
+  .rtcComp1Enable = false,                  /* Don't start counting on RTC COMP1 match. */
+  .comp0Top       = true,                   /* Load COMP0 register into CNT when counter underflows. COMP0 is used as TOP */
+  .bufTop         = false,                  /* Don't load COMP1 into COMP0 when REP0 reaches 0. */
+  .out0Pol        = 0,                      /* Idle value for output 0. */
+  .out1Pol        = 0,                      /* Idle value for output 1. */
+  .ufoa0          = letimerUFOANone,         /* PWM output on output 0 */
+  .ufoa1          = letimerUFOANone,       /* Pulse output on output 1*/
+  .repMode        = letimerRepeatFree       /* Count until stopped */
+  };
+
+  blockSleepMode(Energy_mode);
+  /* Initialize LETIMER */
+  LETIMER_Init(LETIMER0,&letimerInit);
+
+
+}
+
+/* Setting up the ACMP*/
+
+void ACMP_setup(void)
+{
+  /* ACMP configuration constant table. */
+  const ACMP_Init_TypeDef initACMP =
+  {
+    .fullBias = false,                 /* fullBias */
+    .halfBias = true,                  /* halfBias */
+    .biasProg =  0x0,                  /* biasProg */
+    .interruptOnFallingEdge =  false,  /* interrupt on rising edge */
+    .interruptOnRisingEdge =  false,   /* interrupt on falling edge */
+    .warmTime = acmpWarmTime512,       /* 512 cycle warm up to be safe */
+    .hysteresisLevel = acmpHysteresisLevel5, /* hysteresis level 5 */
+    .inactiveValue = false,            /* inactive value */
+    .lowPowerReferenceEnabled = false, /* low power reference */
+    .vddLevel= LEVEL,                  /* VDD level */
+    .enable = true                 /* Don't request enabling. */
+  };
+
+
+  /* Configure ACMP. */
+  ACMP_Init(ACMP0, &initACMP);
+  blockSleepMode(EM1);
+  /*Selecting the channel to get positive input from light excite*/
+  ACMP_ChannelSet(ACMP0, ACMP_NEG_CHANNEL, ACMP_POS_CHANNEL);
+  /*Waiting for the ACMP to warm up*/
+  while (!(ACMP0->STATUS & ACMP_STATUS_ACMPACT)) ;//Warm up
+  unblockSleepMode(EM1);
+
+
+}
+
+int main(void)
+{
+  /* Align different chip revisions */
+  CHIP_Init();
+
+  /* Initialize CMU,LETIMER,calibrate,ACMP,ADC,DMA and GPIO */
+   calib_ultra();
+   CMU_setup();
+   gpio_setup();
+   LETIMER_setup();
+   ACMP_setup();
+   ADCConfig();
+   if(DMA_Status==ON)//if DMA is on, setting up DMA
+   setupDma();
+
+  //------------------------------------------------------------------------
+  /* Enable underflow interrupt */
+  LETIMER_IntEnable(LETIMER0, LETIMER_IF_UF);
+
+  /*Enable Comp1 interrupt */
+  LETIMER_IntEnable(LETIMER0, LETIMER_IF_COMP1);
+
+  /* Enable LETIMER0 interrupt vector in NVIC*/
+  NVIC_EnableIRQ(LETIMER0_IRQn);
+
+
+  while(1)
+    {
+     sleep();//sleep in respective Energy modes
+    }
+}
+

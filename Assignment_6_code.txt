@@ -1,0 +1,304 @@
+/*Including header files*/
+#include <stdint.h>
+#include <stdbool.h>
+#include "em_device.h"
+#include "em_cmu.h"
+#include "em_emu.h"
+#include "em_letimer.h"
+#include "em_timer.h"
+#include "em_gpio.h"
+#include "em_chip.h"
+#include "em_acmp.h"
+#include "dmactrl.h"
+#include "em_adc.h"
+#include "em_dma.h"
+#include "em_int.h"
+#include "em_i2c.h"
+#include "em_leuart.h"
+#include "circular_Buffer.h"
+
+#define ENERGY_MODE EM2
+#define DMA_STATUS 1
+#define I2C_0_ACMP_1 0
+#define Transmit_Port gpioPortD
+#define Transmit_Pin 4
+//#define MAX_LEN 11
+#define CircBuff 0
+#define Period 0.00005
+#define LFXOFreq 32768
+
+typedef enum{
+EM0=0,
+EM1=1,
+EM2=2,
+EM3=3
+}sleepstate_enum;
+
+
+int8_t array1[6]="Hello";
+int8_t array2[6]="World";
+int8_t array3[11];
+int counter1=0;
+int counter2=0;
+int counter3=0;
+unsigned int sleep_block_counter[4];
+
+void sleep(void)
+{
+	if (sleep_block_counter[0] > 0)
+	{
+		return; // Blocked everything below EM0, so just return
+	}
+	else if(sleep_block_counter[1] > 0)
+	{
+	    EMU_EnterEM1(); // Blocked everything below EM1, enter EM1
+
+	}
+	else if(sleep_block_counter[2] > 0)
+	{
+		EMU_EnterEM2(true); //Blocked everything below EM2, enter EM2
+
+	}
+	else if(sleep_block_counter[3]>0)
+	{
+		EMU_EnterEM3(true); //Blocked everything below EM3, enter EM3
+
+	}
+	else
+    return;
+}
+
+
+/***Block Sleep Mode routine taken from SILICON LABS**/
+void blockSleepMode(sleepstate_enum minimumMode)
+{
+	INT_Disable();
+	sleep_block_counter[minimumMode]++;
+	INT_Enable();
+}
+
+/*UNblock Sleep Routine taken from SILICON LABS**/
+void unblockSleepMode(sleepstate_enum minimumMode)
+{
+	INT_Disable();
+	if(sleep_block_counter[minimumMode]>0)
+	sleep_block_counter[minimumMode]--;
+	else
+		sleep_block_counter[minimumMode]=0;
+	INT_Enable();
+}
+
+void CMU_Setup()
+{
+	/**** enable ULFRCO for EM3 Mode******/
+	    if(ENERGY_MODE==EM3)
+	    {
+	    	CMU_ClockSelectSet(cmuClock_LFA,cmuSelect_ULFRCO);
+	        CMU_OscillatorEnable(cmuOsc_LFXO,true,true);
+	    }
+	    else
+	    CMU_ClockSelectSet(cmuClock_LFA,cmuSelect_LFXO);
+	    CMU_ClockSelectSet(cmuClock_LFB,cmuSelect_LFXO);
+	    CMU_ClockEnable(cmuClock_ADC0, true);
+
+	    CMU_ClockEnable(cmuClock_LETIMER0, false);
+	    CMU_ClockEnable(cmuClock_GPIO,true);
+	    if(I2C_0_ACMP_1==1)
+	    CMU_ClockEnable(cmuClock_ACMP0, true);
+
+	    else if(I2C_0_ACMP_1==0)
+	    {
+	    	    CMU_ClockEnable(cmuClock_CORELE, true);
+	    		CMU_ClockEnable(cmuClock_HFPER,true);
+	    		CMU_ClockEnable(cmuClock_I2C0, true);
+	    	    CMU_ClockEnable(cmuClock_I2C1, true);
+	    	    CMU_ClockEnable(cmuClock_ACMP0, false);
+	     }
+	    if(DMA_STATUS==1)
+	    CMU_ClockEnable(cmuClock_DMA, true);
+
+}
+
+void GPIO_Setup()
+{
+	CMU_ClockEnable(cmuClock_GPIO, true);
+	GPIO_PinModeSet(Transmit_Port, Transmit_Pin, gpioModePushPull, 0);
+}
+
+void circ_buff(void)
+{
+	int i;
+_transmit_buffer.buff = allocate_memory(&_transmit_buffer);
+			_transmit_buffer.head=_transmit_buffer.buff;
+					 	_transmit_buffer.tail=_transmit_buffer.buff;
+					 	_transmit_buffer.buff=_transmit_buffer.buff;
+					 	_transmit_buffer.num_items= 0;
+					 	_transmit_buffer.length = MAX_LEN;
+
+					 	for(i=0;i<5;i++)
+					 		put_item_tobuffer(&_transmit_buffer,array1[i]);
+					 	for(i=0;i<5;i++)
+					 		put_item_tobuffer(&_transmit_buffer,array2[i]);
+
+}
+
+LEUART_Init_TypeDef leuart0Init =
+{
+  .enable   = leuartEnableTx,       /* Activate data reception on LEUn_TX pin. */
+  .refFreq  = 0,                    /* Inherit the clock frequenzy from the LEUART clock source */
+  .baudrate = 9600,                 /* Baudrate = 9600 bps */
+  .databits = leuartDatabits8,      /* Each LEUART frame contains 8 databits */
+  .parity   = leuartNoParity,       /* No parity bits in use */
+  .stopbits = leuartStopbits1,      /* Setting the number of stop bits in a frame to 2 bitperiods */
+};
+
+void initLeuart(void)
+{
+  /* Reseting and initializing LEUART1 */
+  LEUART_Reset(LEUART0);
+  	    CMU_ClockSelectSet(cmuClock_LFB,cmuSelect_LFRCO);
+  	  CMU_ClockEnable(cmuClock_LEUART0,true);
+  LEUART_Init(LEUART0, &leuart0Init);
+
+  /* Route LEUART1 TX pin to DMA location 0 */
+  LEUART0->ROUTE = LEUART_ROUTE_TXPEN |
+                   LEUART_ROUTE_LOCATION_LOC0;
+
+  /* Enable GPIO for LEUART1. TX is on C6 */
+  GPIO_PinModeSet(Transmit_Port,                /* GPIO port */
+		  	  	  Transmit_Pin,                        /* GPIO port number */
+                  gpioModePushPull,         /* Pin mode is set to push pull */
+                  1);                       /* High idle state */
+
+
+  LEUART0->CMD |=(LEUART_CMD_TXEN | LEUART_CMD_RXEN);//Enabling Receiver and Transmitter
+  LEUART0->CTRL |=(LEUART_CTRL_LOOPBK | LEUART_CTRL_AUTOTRI);//Enabling Autotri state and loopback
+  LEUART0->IEN |=(LEUART_IEN_TXBL|LEUART_IEN_TXC);
+  //NVIC_EnableIRQ(LEUART0_IRQn);//Enabling interrupt handler
+
+
+}
+
+void letimer_setup()
+{
+	 CMU_ClockEnable(cmuClock_CORELE, true);
+     CMU_OscillatorEnable(cmuOsc_LFXO,true,true);
+	 CMU_ClockSelectSet(cmuClock_LFA,cmuSelect_LFXO);
+	 CMU_ClockEnable(cmuClock_LETIMER0, true);
+	 float b;
+	 	unsigned int Comp0;
+	 	unsigned int Comp1;
+	 	unsigned int LETIMER0_prescaler;
+
+	 		LETIMER0_prescaler= Period/2;
+	 		CMU->LFAPRESC0&= 0xfffff0ff;//clearing the prescaler register
+	 		CMU->LFAPRESC0|= LETIMER0_prescaler << 8;//shift prescaler into position
+	 		LETIMER0_prescaler = 1 << LETIMER0_prescaler ;//the value of prescaler register
+	 		Comp0=Period*(LFXOFreq/LETIMER0_prescaler);// moving the final value to Comp0
+	     /* Set initial compare values for COMP0 and Comp1 */
+	     LETIMER_CompareSet(LETIMER0, 0,Comp0);
+	     //LETIMER_CompareSet(LETIMER0,1,Comp1);
+	     /* Set configurations for LETIMER 0 */
+	     const LETIMER_Init_TypeDef letimerInit =
+	     {
+	         .enable         = true,                   /* start counting when init completed - only with RTC compare match */
+	         .debugRun       = false,                  /* Counter shall not keep running during debug halt. */
+	         .rtcComp0Enable = false,                  /* DON'T Start counting on RTC COMP0 match. */
+	         .rtcComp1Enable = false,                  /* Don't start counting on RTC COMP1 match. */
+	         .comp0Top       = true,                  /* Load COMP0 register into CNT when counter underflows. COMP is used as TOP */
+	         .bufTop         = false,                  /* Don't load COMP1 into COMP0 when REP0 reaches 0. */
+	         .out0Pol        = 0,                      /* Idle value for output 0. */
+	         .out1Pol        = 0,                      /* Idle value for output 1. */
+	         .ufoa0          = letimerUFOANone,        /* Pulse output on output 0 */
+	         .ufoa1          = letimerUFOANone,        /* No output on output 1*/
+	         .repMode        = letimerRepeatFree,      /*Free mode*/
+	     };
+
+	     /* Initialize LETIMER */
+	     LETIMER_Init(LETIMER0, &letimerInit);
+	    /*****enabling interrupts for ComP1 and UF***/
+	     //LETIMER_IntEnable(LETIMER0,LETIMER_IF_COMP1);
+	     LETIMER_IntEnable(LETIMER0, LETIMER_IF_COMP0);
+	    // LETIMER_IntEnable(LETIMER0, LETIMER_IF_UF);
+	     //adding these interrupts to nested interrupts
+	    // NVIC_EnableIRQ(LETIMER0_IRQn);
+	 }
+void LETIMER0_IRQHandler(void)
+{
+	INT_Disable();
+	int i;
+
+	int intFlags = LETIMER0->IF;//the value of interrupt flag
+    LETIMER0->IFC=intFlags;
+
+    if(CircBuff==1)
+    			LEUART0->TXDATA=read_delete_item_frombuffer(&_transmit_buffer);
+		for(i=0; i<5;i++)
+		{
+			array3[counter2]=array2[i];
+		counter2++;
+
+		}
+		//if(array2[i]=='\0')
+		LETIMER_IntDisable(LETIMER0, LETIMER_IF_COMP0);
+
+INT_Enable();
+}
+
+void LEUART0_IRQHandler()
+{
+	//INT_Disable();
+	int flag=LEUART0->IF;
+	LEUART0->IFC=flag;
+	if(flag & LEUART_IF_TXBL){
+	if(CircBuff==1)
+	{
+		LEUART0->TXDATA= read_delete_item_frombuffer(&_transmit_buffer);
+	}
+	else
+	{
+		LEUART0->TXDATA= array3[counter1];
+		counter1++;
+		//if(counter1==2)
+
+	}
+	}
+	if(flag & LEUART_IF_TXC)
+	{
+		if(CircBuff==1)
+			LEUART0->TXDATA=read_delete_item_frombuffer(&_transmit_buffer);
+		else
+		{
+			if(counter3<6)
+			{
+			array3[counter2]=array1[counter3];
+			counter2++;
+			counter3++;
+			}
+		}
+	}
+	//INT_Enable();
+}
+
+int main(void)
+{
+    /* Align different chip revisions */
+     CHIP_Init();
+
+     CMU_Setup();
+     GPIO_Setup();
+
+     letimer_setup();
+     circ_buff();
+     initLeuart();
+    NVIC_EnableIRQ(LETIMER0_IRQn);
+    NVIC_EnableIRQ(LEUART0_IRQn);
+
+
+    while(1)
+      {
+
+    	EMU_EnterEM2(true);
+
+      }
+}

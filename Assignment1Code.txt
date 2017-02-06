@@ -1,0 +1,223 @@
+/**************************************************************************//**
+ * @file
+ * @brief Empty Project
+ * @author Energy Micro AS
+ * @version 3.20.2
+ ******************************************************************************
+ * @section License
+ * <b>(C) Copyright 2014 Silicon Labs, http://www.silabs.com</b>
+ *******************************************************************************
+ *
+ * This file is licensed under the Silicon Labs Software License Agreement. See 
+ * "http://developer.silabs.com/legal/version/v11/Silicon_Labs_Software_License_Agreement.txt"  
+ * for details. Before using this software for any purpose, you must agree to the 
+ * terms of that agreement.
+ *
+ ******************************************************************************/
+
+/*
+ * Assignment 1
+ * Author : Sayan Barman
+ * Course : Mobile Computing and IOT Security
+ *
+ * Description :  Program to program LETIMER0 peripheral so that LED0 blinks for 50mS
+ * every 2.0 seconds using the LETIMER0, LETIMER0 interrupt handler,
+ * and the sleep() routine.
+ */
+
+
+
+
+/*including header files*/
+#include <stdint.h>
+#include <stdbool.h>
+#include "em_device.h"
+#include "em_chip.h"
+#include "em_int.h"
+#include "em_cmu.h"
+#include "em_emu.h"
+#include "em_letimer.h"
+#include "em_gpio.h"
+
+/* Energy mode can be changed here to test the code in different energy modes*/
+#define LETIMER_mode EM3
+
+//Setting numbers to different energy modes
+typedef enum{
+EM0=0,
+EM1=1,
+EM2=2,
+EM3=3
+}sleepstate_enum;
+
+
+
+int sleep_block_counter[4];//integer array to hold values 0 and 1 for different energy modes
+
+
+
+/* Interrupt Service Routine for LETIMER0 */
+
+void LETIMER0_IRQHandler(void)
+{
+
+
+	INT_Disable();//disabling all interrupts
+
+	volatile int flag=LETIMER0->IF; //reading the interrupt
+
+	LETIMER0->IFC=flag;//clearing it
+	GPIO_PinOutToggle(gpioPortE,2);//turning the LED ON
+	INT_Enable(); //enabling all interrupts
+
+}
+
+
+
+/* blockSleepMode routine taken from SILICON LABS */
+
+void blockSleepMode(sleepstate_enum minimumMode)
+{
+INT_Disable();
+sleep_block_counter[minimumMode]++;
+INT_Enable();
+}
+
+
+
+/* sleep routine taken from SILICON LABS */
+
+void sleep(void)
+{
+	if (sleep_block_counter[0] > 0)
+	{
+		return; // Blocked everything below EM0, so just return
+	}
+	else if(sleep_block_counter[1] > 0)
+	{
+	    EMU_EnterEM1(); // Blocked everything below EM1, enter EM1
+
+	}
+	else if(sleep_block_counter[2] > 0)
+	{
+		EMU_EnterEM2(true); //Blocked everything below EM2, enter EM2
+
+	}
+	else
+	{
+		EMU_EnterEM3(true); //Blocked everything below EM3, enter EM3
+
+	}
+
+}
+
+
+
+
+/* Setting up GPIO  */
+
+void gpioSetup(void)
+{
+  /* Enable GPIO in CMU */
+  CMU_ClockEnable(cmuClock_GPIO, true);
+
+
+  GPIO_PinModeSet(gpioPortE, 2, gpioModePushPull, 0); //Set Pin to control LED-0
+
+}
+
+
+
+
+/*Setting up the Clock Management Unit */
+
+void CMU_setup()
+{
+    /*Selecting LFXO for EM0-EM2 and ULFRCO for EM3 */
+	if(LETIMER_mode==EM0 || LETIMER_mode==EM1 || LETIMER_mode==EM2)
+	  CMU_ClockSelectSet(cmuClock_LFA, cmuSelect_LFXO);
+		else
+			CMU_ClockSelectSet(cmuClock_LFA, cmuSelect_ULFRCO);
+
+	/* Enabling CORE,LETIMER0 and GPIO clocks*/
+	CMU_ClockEnable(cmuClock_CORELE, true);
+	CMU_ClockEnable(cmuClock_LETIMER0, true);
+	CMU_ClockEnable(cmuClock_GPIO, true);
+
+}
+
+
+
+
+/* Setting up LETIMER */
+
+void LETIMER_setup(void)
+{
+  /*Setting a counter of 2sec on Comp0Top and 50ms on Comp1 to produce an interrupt at Comp1
+   *  Setting different frequencies for LFXO and ULFRCO  */
+    if(LETIMER_mode==EM0 || LETIMER_mode==EM1 || LETIMER_mode==EM2)
+    {
+    	LETIMER_CompareSet(LETIMER0, 0, 2*32767 + 1);
+    	LETIMER_CompareSet(LETIMER0, 1, 0.05*32768);
+    }
+  else
+  {
+	  LETIMER_CompareSet(LETIMER0, 0, 2*1000);
+	  LETIMER_CompareSet(LETIMER0, 1, 0.05*1000);
+  }
+
+
+  /* Set configurations for LETIMER 0 */
+  const LETIMER_Init_TypeDef letimerInit =
+  {
+  .enable         = true,                   /* Start counting when init completed. */
+  .debugRun       = false,                  /* Counter shall not keep running during debug halt. */
+  .rtcComp0Enable = false,                  /* Don't start counting on RTC COMP0 match. */
+  .rtcComp1Enable = false,                  /* Don't start counting on RTC COMP1 match. */
+  .comp0Top       = true,                   /* Load COMP0 register into CNT when counter underflows. COMP0 is used as TOP */
+  .bufTop         = false,                  /* Don't load COMP1 into COMP0 when REP0 reaches 0. */
+  .out0Pol        = 0,                      /* Idle value for output 0. */
+  .out1Pol        = 0,                      /* Idle value for output 1. */
+  .ufoa0          = letimerUFOANone,         /* PWM output on output 0 */
+  .ufoa1          = letimerUFOANone,       /* Pulse output on output 1*/
+  .repMode        = letimerRepeatFree       /* Count until stopped */
+  };
+
+  /* Initialize LETIMER */
+  LETIMER_Init(LETIMER0, &letimerInit);
+  blockSleepMode(LETIMER_mode);
+}
+
+
+
+
+
+/*  Main function */
+
+int main(void)
+{
+  /* Align different chip revisions */
+  CHIP_Init();
+
+  /* Initialize CMU,LETIMER and GPIO */
+      CMU_setup();
+      LETIMER_setup();
+      gpioSetup();
+
+  //-----------------------------------------------------------------------------------
+  /* Enable underflow interrupt */
+  LETIMER_IntEnable(LETIMER0, LETIMER_IF_UF);
+
+  /*Enable Comp1 interrupt */
+  LETIMER_IntEnable(LETIMER0, LETIMER_IF_COMP1);
+
+  /* Enable LETIMER0 interrupt vector in NVIC*/
+  NVIC_EnableIRQ(LETIMER0_IRQn);
+
+
+  while(1)
+  {
+       sleep();
+
+  }
+}
