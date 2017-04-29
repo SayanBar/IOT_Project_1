@@ -1040,7 +1040,7 @@ void I2C_READ2(void)
 
 
 	      uint32_t adc_temp_val=((arr[3]<<12)|(arr[4])<<4|(last));
-	      final_temp_val=(double)(BME280_compensate_T_double(adc_temp_val)-7);
+	      final_temp_val=(double)(BME280_compensate_T_double(adc_temp_val));
 	      int avg1=(int8_t)final_temp_val;
 	      	float diff= (final_temp_val - avg1)*10;
 	      put_item_tobuffer(&_transmit_buffer,'T');
